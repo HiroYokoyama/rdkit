@@ -1,5 +1,6 @@
 import sys
 import os
+import ast
 import glob
 import builtins
 import importlib
@@ -20,6 +21,9 @@ PATCH_EXT = ".diff"
 IMPORT_MODULES = re.compile(r"^\s*import\s+(.*)$")
 FROM_IMPORT_MODULES = re.compile(r"^\s*from\s+(\S+)\s+import\s+(.*)$")
 PYI_TO_PY = re.compile(r"\.pyi$")
+ANNOTATION_LINE = re.compile(r"^\s*[^:=\s]+\s*:\s*\S.*$")
+DEF_LINE = re.compile(r"^(\s*def\s+\w+\s*)\(.*\)(\s*->\s*[^:]+)?:\s*$")
+MAX_REPAIRS = 200
 RDKIT_MODULE_NAME = "rdkit"
 RDBASE_MODULE_NAME = "rdBase"
 INIT_PY = "__init__.py"
@@ -89,6 +93,58 @@ def patch_stubs(tempdir, src_entry):
         patch_file = os.path.join(patch_dir, pyi_rel + PATCH_EXT)
         if os.path.exists(patch_file):
             apply_patch(tempdir, patch_file)
+
+def repair_stub_line(line):
+    """Returns a parseable replacement for line, or None if there is none.
+
+    Args:
+        line (str): a line of a generated stub that keeps it from parsing
+
+    Returns:
+        str or None: the replacement, or None if line cannot be repaired
+    """
+    m = DEF_LINE.match(line)
+    if m:
+        return f"{m.group(1)}(*args: typing.Any, **kwargs: typing.Any){m.group(2) or ''}:\n"
+    return "" if ANNOTATION_LINE.match(line) else None
+
+def sanitize_stubs(src_entry):
+    """Repairs the generated stubs in src_entry, failing on any left unparseable.
+
+    Boost.Python type names reach the stubs verbatim, so an annotation can hold
+    something that is not an expression: MSVC spells the vector wrappers
+    "_vectunsigned int" where gcc uses the mangled "_vectj". An enum member can
+    also be named after a keyword, as RGroupCoreAlignment.None is.
+
+    Args:
+        src_entry (str): full path to the directory holding the generated stubs
+
+    Raises:
+        RuntimeError: if a stub still does not parse after repair
+    """
+    unparseable = []
+    for pyi in glob.glob(os.path.join(src_entry, "**/*.pyi"), recursive=True):
+        with open(pyi, encoding="utf-8") as hnd:
+            original = hnd.read()
+        src = original
+        for _ in range(MAX_REPAIRS):
+            try:
+                ast.parse(src)
+                break
+            except SyntaxError as e:
+                lines = src.splitlines(keepends=True)
+                repaired = repair_stub_line(lines[e.lineno - 1]) if e.lineno else None
+                if repaired is None:
+                    unparseable.append(f"{pyi}:{e.lineno}: {e.msg}")
+                    break
+                lines[e.lineno - 1] = repaired
+                src = "".join(lines)
+        if src != original:
+            logger.warning("repaired generated stub %s", pyi)
+            with open(pyi, "w", encoding="utf-8") as hnd:
+                hnd.write(src)
+    if unparseable:
+        raise RuntimeError("generated stubs do not parse:\n  " + "\n  ".join(unparseable))
 
 def copy_stubs(src_entry, outer_dirs):
     """Copy src_entry to each directory in outer_dirs.
@@ -207,6 +263,7 @@ def generate_stubs_internal(modules, outer_dirs, args):
             logger.warning(concat_out)
         if os.path.isdir(src_dir):
             patch_stubs(tempdir, src_dir)
+            sanitize_stubs(src_dir)
             for f in os.listdir(src_dir):
                 src_entry = os.path.join(src_dir, f)
                 if os.path.exists(src_entry):
